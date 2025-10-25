@@ -1,6 +1,6 @@
 # 🔍 AI Grounded Search Portal
 This project is a Streamlit application that provides a powerful, grounded search experience using the Gemini API and Google Search grounding to retrieve real-time, up-to-date information.
-The repository includes both a public web application and a command-line interface (CLI) tool for direct querying.
+The repository includes both a public web application.
 
 # 🚀 Live Web Application
 You can access and interact with the live application deployed on Streamlit Community Cloud here:
