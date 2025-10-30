@@ -1,116 +1,162 @@
-import argparse
+import streamlit as st
 import requests
 import json
 import os
 from dotenv import load_dotenv
-from urllib.parse import urlparse
 
 # --- Configuration ---
-# Load API Key from .env file (required for local CLI use)
 load_dotenv()
-API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+# The API key must be set either in a local .env file or in Streamlit Secrets
+API_KEY = os.getenv("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
 
+if not API_KEY:
+    st.error("🚨 Configuration Error: GOOGLE_API_KEY not found. Please set it in your local .env file or Streamlit Secrets.")
+    st.stop()
+
+# Google GenAI API endpoint details
 MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
-API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
-API_URL = f"{API_BASE_URL}{MODEL_NAME}:generateContent?key={API_KEY}"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
 
-# --- Utility Functions (Same as in main.py) ---
+# --- Rate Limiting Setup ---
+MAX_CALLS_PER_SESSION = 5
+CALL_COUNT_KEY = 'api_call_count'
 
-def clean_and_format_sources(grounding_metadata):
-    """
-    Extracts and formats source URIs and titles from grounding metadata.
-    Returns a string listing the sources.
-    """
-    sources = []
-    if grounding_metadata and grounding_metadata.get('groundingAttributions'):
-        for attribution in grounding_metadata['groundingAttributions']:
-            web = attribution.get('web')
-            if web and web.get('uri') and web.get('title'):
-                uri = web['uri']
-                title = web['title']
-                domain = urlparse(uri).netloc
-                sources.append(f"- {title}\n  (Source: {domain})")
-    
-    if sources:
-        return "\n\n--- Sources ---\n" + "\n".join(sources)
-    return ""
+# Initialize session state for the call count
+if CALL_COUNT_KEY not in st.session_state:
+    st.session_state[CALL_COUNT_KEY] = 0
 
-def generate_content_with_gemini(prompt, system_prompt, temperature, use_grounding):
+# --- Helper Functions ---
+
+def generate_grounded_content(query, system_prompt):
     """
-    Makes the API call to the Gemini model with optional grounding.
+    Calls the Gemini API with Google Search grounding enabled.
     """
-    if not API_KEY:
-        return "Error: GOOGLE_API_KEY not found. Please set it in your .env file.", {}
-        
-    headers = {'Content-Type': 'application/json'}
-    
-    # Build the payload (using defaults from your Streamlit app)
     payload = {
-        "contents": [{ "parts": [{ "text": prompt }] }],
-        "systemInstruction": {
-            "parts": [{ "text": system_prompt }]
-        },
-        "config": {
-            "temperature": temperature
-        }
+        "contents": [{"parts": [{"text": query}]}],
+        "tools": [{"google_search": {}}],  # Enable Google Search grounding
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
     }
 
-    if use_grounding:
-        payload["tools"] = [{"google_search": {}}]
+    # Exponential backoff for API calls
+    for attempt in range(5):
+        try:
+            response = requests.post(
+                API_URL,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=30  # Increased timeout for complex searches
+            )
+            response.raise_for_status()
+            return response.json()
 
-    print(f"-> Sending request to Gemini with grounding: {use_grounding}")
+        except requests.exceptions.RequestException as e:
+            if attempt < 4:
+                # Wait longer on each subsequent failed attempt
+                import time
+                time.sleep(2 ** attempt)
+            else:
+                st.exception(f"API Request Failed after multiple retries: {e}")
+                return None
+    return None
+
+def extract_and_format_response(result):
+    """
+    Extracts the text and source citations from the Gemini API response.
+    """
+    if not result or 'candidates' not in result or not result['candidates']:
+        return "⚠️ Received an empty or invalid response from the API.", []
+
+    candidate = result['candidates'][0]
+    generated_text = candidate.get('content', {}).get('parts', [{}])[0].get('text', 'No text generated.')
+    sources = []
+
+    # Extract grounding sources
+    grounding_metadata = candidate.get('groundingMetadata', {})
+    if grounding_metadata and grounding_metadata.get('groundingAttributions'):
+        for attribution in grounding_metadata['groundingAttributions']:
+            web_info = attribution.get('web')
+            if web_info and web_info.get('uri') and web_info.get('title'):
+                sources.append({
+                    'title': web_info['title'],
+                    'uri': web_info['uri']
+                })
     
-    try:
-        # Note: Added simple retry logic for robustness (Exponential backoff is a best practice)
-        for attempt in range(3):
-            response = requests.post(API_URL, headers=headers, data=json.dumps(payload))
-            if response.status_code != 429: # Not a rate limit error
-                break
-            print(f"Rate limit hit (429). Retrying in {2**attempt} seconds...")
-            time.sleep(2**attempt)
+    return generated_text, sources
+
+# --- Streamlit UI and Logic ---
+
+st.set_page_config(
+    page_title="AI Grounded Search Portal",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+st.title("🌐 AI Grounded Search Portal")
+st.markdown("Ask any question to get an up-to-date answer backed by Google Search results.")
+
+# Sidebar for controls and status
+with st.sidebar:
+    st.header("App Status")
+    
+    # Display rate limit status
+    remaining_calls = MAX_CALLS_PER_SESSION - st.session_state[CALL_COUNT_KEY]
+    
+    if remaining_calls > 0:
+        st.success(f"Searches Remaining: {remaining_calls} / {MAX_CALLS_PER_SESSION}")
+    else:
+        st.error(f"Daily Limit Reached: {MAX_CALLS_PER_SESSION} / {MAX_CALLS_PER_SESSION}")
+        st.info("Please refresh the app to start a new session.")
+
+    st.markdown("---")
+    st.caption("Powered by Google Gemini API.")
+    st.caption("The code uses Streamlit Secrets to securely hide your API key.")
+
+
+# System prompt to guide the model's behavior
+system_prompt = (
+    "You are an expert research assistant. Your task is to provide accurate, "
+    "concise, and well-structured answers to user queries, primarily using the "
+    "information provided by the Google Search grounding tool. Always prioritize "
+    "information found through search over internal knowledge. State your answer clearly, "
+    "and do not repeat the question."
+)
+
+# Main input form
+with st.form("search_form"):
+    user_query = st.text_area("Enter your search query:", placeholder="e.g., What are the latest developments in fusion energy as of today?", height=100)
+    submitted = st.form_submit_button("Search for Grounded Answer")
+
+if submitted and user_query:
+    if st.session_state[CALL_COUNT_KEY] >= MAX_CALLS_PER_SESSION:
+        st.warning("⚠️ **Rate Limit Exceeded:** You have reached the maximum number of searches for this session. Please refresh the page to try again.")
+    else:
+        # Increment call count immediately
+        st.session_state[CALL_COUNT_KEY] += 1
+        
+        # Display the updated status in the sidebar
+        st.rerun() 
+        
+        st.subheader("Results")
+        with st.spinner("Searching the web and generating content..."):
             
-        response.raise_for_status()
-        result = response.json()
-        
-        candidate = result.get('candidates', [{}])[0]
-        text = candidate.get('content', {}).get('parts', [{}])[0].get('text', 'No content generated.')
-        
-        grounding_metadata = candidate.get('groundingMetadata', {})
-        
-        return text, grounding_metadata
+            # Make the API call
+            api_result = generate_grounded_content(user_query, system_prompt)
+            
+            if api_result:
+                # Extract and format the response
+                generated_text, sources = extract_and_format_response(api_result)
 
-    except requests.exceptions.RequestException as e:
-        error_message = f"API Request Error: {e}"
-        if response.status_code == 429:
-             error_message = "**Fatal Error:** Google API quota exhausted or rate limited too heavily."
-        elif response.status_code == 400:
-             error_message = f"**Client Error:** Check your API key and input parameters. Response: {response.text}"
-        return error_message, {}
-    except Exception as e:
-        return f"An unexpected error occurred: {e}", {}
+                # Display the main answer
+                st.markdown("### 💡 AI Generated Answer")
+                st.info(generated_text)
 
-# --- Main CLI Execution ---
-if __name__ == "__main__":
-    import time # Import time here for use in retry logic
-
-    parser = argparse.ArgumentParser(description="Run a grounded search query using the Gemini API.")
-    parser.add_argument("query", type=str, help="The search query to send to the AI model.")
-    parser.add_argument("--grounding", type=bool, default=True, help="Enable/Disable Google Search grounding (default: True)")
-    parser.add_argument("--temp", type=float, default=0.2, help="Set model temperature (0.0 to 1.0, default: 0.2)")
-    
-    args = parser.parse_args()
-
-    # Use the default system prompt from your Streamlit app
-    default_system_prompt = "You are a friendly, factual, and concise research assistant. Summarize findings in bullet points unless otherwise instructed."
-
-    print("--- AI Search Results ---")
-    
-    response_text, grounding_metadata = generate_content_with_gemini(
-        prompt=args.query,
-        system_prompt=default_system_prompt,
-        temperature=args.temp,
-        use_grounding=args.grounding
-    )
-
-    print(response_text)
-    print(clean_and_format_sources(grounding_metadata))
+                # Display sources if available
+                if sources:
+                    st.markdown("### 📚 Grounding Sources")
+                    for i, source in enumerate(sources):
+                        st.markdown(f"**{i+1}.** [{source['title']}]({source['uri']})")
+                else:
+                    st.warning("No specific grounding sources were found for this query.")
+            
+            else:
+                st.error("Failed to get a response from the Gemini API.")
