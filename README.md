@@ -6,6 +6,11 @@ The repository includes both a public web application.
 You can access and interact with the live application deployed on Streamlit Community Cloud here:
  [➡️ Launch AI Search Portal](https://ai-search-app-7hq63kmdyykhoam9eetjox.streamlit.app/)
 
+<!-- Cover -->
+<br />
+<div>
+   <img align="left" align="left" alt="HTML" width="100%" style="padding-right:10px;" src="https://i.imgur.com/GgZC4B1.jpeg" />   
+</div>
 
 # 💻 Running the Project Locally
 ### Prerequisites
